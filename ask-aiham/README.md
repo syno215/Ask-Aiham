@@ -1,6 +1,6 @@
 # ASK AIHAM!
 
-A Persona 5-inspired (original graphics, no copyrighted game assets) public Q&A website.
+A public Q&A website.
 
 ## Features
 - Guests can submit questions with a required display name, without an account.
