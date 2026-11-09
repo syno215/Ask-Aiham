@@ -1,46 +1,32 @@
-# ASK AIHAM!
+# Ask Aiham — Supabase / Vercel migration (v2)
 
-A public Q&A website.
+This replaces the SQLite/Express backend. Existing data in SQLite is **not** imported automatically. Keep your old ZIP as a backup. The original Persona-style front end and Expose font are included.
 
-## Features
-- Guests can submit questions with a required display name, without an account.
-- Optional accounts remember names and show personal question history.
-- Each question is public or private at the submitter's choice.
-- Public questions are invisible until the admin publishes them.
-- Private guest questions use unguessable secret links. Save the link immediately.
-- Only the question owner or admin can add replies; public replies require admin approval.
-- Admin can answer, publish, hide, delete, and moderate.
-- Searchable public archive, responsive red/black/white interface.
+## 1. Database
+The `01_database.sql` file from the earlier step should already have been run. **Do not run it again.** This version uses the existing `profiles`, `admins`, `questions`, `replies` tables. RLS is enabled and public direct table access is revoked. All database operations run via a server-only API.
 
-## Run locally
+## 2. GitHub
+Replace the old repository's files with the contents of this package (upload the CONTENTS, not the parent folder). Remove old `server.js` and `better-sqlite3` files. The `public/` directory and `api/[...path].js` must remain in the structure shown.
 
-Requires Node.js 20+ and a C++ build toolchain (for better-sqlite3).
+## 3. Vercel
+Import the GitHub repository in Vercel. Framework Preset: Other. Root directory: repository root. No build command required. Add Environment Variables (Production/Preview):
 
-```bash
-cp .env.example .env
-# Edit .env with a random SESSION_SECRET and your admin email/password.
-npm install
-npm start
-```
+- `SUPABASE_URL`: Supabase project URL
+- `SUPABASE_PUBLISHABLE_KEY`: the browser-safe `sb_publishable_...` key
+- `SUPABASE_SECRET_KEY`: a **secret** `sb_secret_...` key; get it in Supabase Settings → API Keys, paste ONLY into Vercel environment variables. NEVER put it in GitHub, chat, browser JS, or screenshots.
 
-Open http://localhost:3000. Log in with ADMIN_EMAIL and ADMIN_PASSWORD.
+Deploy. Vercel's public static directory serves the site; `/api/...` routes use the serverless function.
 
-Environment variables are read by the process; Node 20 does not automatically load .env. For local use, start with `node --env-file=.env server.js` or export the variables first. Node 22+ supports `node --env-file=.env server.js`.
+## 4. Admin access
+Register an account on the deployed site and confirm its email. In Supabase SQL Editor, open `02_make_admin.sql`, replace the placeholder with the exact account email, run it. Sign out and log in again. This makes ONLY that account admin.
 
-## Deployment
+## 5. Test BEFORE sharing the URL
+- Guest public question: initially not in archive; admin can publish.
+- Guest private question: only admin or someone with its secret URL can view; admin cannot publish it.
+- Account sign-up: email confirmation, sign-in, saved questions.
+- Public replies: follow-ups await moderation; admin can approve.
+- Private replies: visible only to thread owner and admin.
+- Check on a separate incognito browser that no other user's private content is visible.
 
-Deploy as a persistent Node server (e.g., Render or Railway) with the environment variables from `.env.example`. **Use a persistent disk** and set DB_PATH to a path on that disk. Do not use ephemeral disk for real submissions or they will be lost on restart. Set NODE_ENV=production and use HTTPS for secure session cookies. Set BASE_URL to your public site URL (currently informational only).
-
-## Before making it public
-
-- Change admin credentials and use a strong, unique session secret.
-- Add email verification/password reset for accounts (not included in this MVP).
-- Add CAPTCHA or provider-backed spam controls, and durable rate limiting (currently in-memory per-process).
-- Add privacy policy, contact details, retention/deletion policy and consent mechanisms appropriate for GDPR.
-- Set up automatic database backups.
-- For sensitive private questions, use registered accounts rather than secret guest links; anyone possessing a guest link can view the conversation.
-- Do not use this as a secure channel for confidential or regulated information.
-
-## Notes
-
-This is a functioning self-hosted MVP, not a live deployed site. No emails or push notifications are implemented yet. Admin checks the inbox manually. Users cannot reset passwords yet.
+## Security and limitations
+This is a **deployment candidate, not production audited**. Before public launch add CAPTCHA (e.g. Turnstile), server-side rate limiting, email recovery, GDPR/privacy and deletion controls, and monitoring. Serverless endpoints currently have no anti-spam throttle; don't share broadly yet. Guest secret URLs grant access to anyone possessing the link. Auth tokens are currently stored in localStorage: for higher-security deployments, migrate to httpOnly cookies and CSRF protection. The publishable key is public, but the server secret must never be exposed. Confirm your Expose font license allows website embedding.
