@@ -1,5 +1,5 @@
 
-const app = document.querySelector('#app');
+import {createClient} from '@supabase/supabase-js';
 
 let me = null;
 let current = 'home';
