@@ -13,35 +13,131 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({
   "'": '&#39;'
 }[c]));
 
-const api = async (url, opts = {}) => {
-  const r = await fetch('/api' + url, {
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'same-origin',
-    ...opts
+const SESSION_KEY = 'ask-aiham-session';
+let session = null;
+
+try {
+  session = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
+} catch {
+  localStorage.removeItem(SESSION_KEY);
+}
+
+function saveSession(value) {
+  session = value;
+  if (value) localStorage.setItem(SESSION_KEY, JSON.stringify(value));
+  else localStorage.removeItem(SESSION_KEY);
+}
+
+async function refreshSession() {
+  if (!session?.refresh_token) return false;
+
+  try {
+    const response = await fetch('/api/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        refresh_token: session.refresh_token
+      }),
+      cache: 'no-store'
+    });
+
+    const data = await response.json();
+
+    if (!response.ok || !data.session?.access_token) {
+      saveSession(null);
+      return false;
+    }
+
+    saveSession(data.session);
+    return true;
+  } catch (error) {
+    console.error('Session refresh failed:', error);
+    return false;
+  }
+}
+
+let pendingRefresh = null;
+
+function refreshOnce() {
+  if (!pendingRefresh) {
+    pendingRefresh = refreshSession().finally(() => {
+      pendingRefresh = null;
+    });
+  }
+  return pendingRefresh;
+}
+
+async function api(url, opts = {}, retry = true) {
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(opts.headers || {})
+  };
+
+  if (session?.access_token) {
+    headers.Authorization = `Bearer ${session.access_token}`;
+  }
+
+  const response = await fetch('/api' + url, {
+    ...opts,
+    headers,
+    cache: 'no-store'
   });
 
-  const data = await r.json();
+  if (
+    response.status === 401 &&
+    retry &&
+    session?.refresh_token &&
+    !['/login', '/register', '/refresh'].includes(url)
+  ) {
+    if (await refreshOnce()) {
+      return api(url, opts, false);
+    }
+  }
 
-  if (!r.ok) {
-    throw new Error(data.error || 'Something went wrong');
+  let data;
+
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error(
+      `Server returned an invalid response (HTTP ${response.status}).`
+    );
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      data.error || `Request failed (HTTP ${response.status}).`
+    );
   }
 
   return data;
-};
+}
 
 const post = (url, data, method = 'POST') =>
   api(url, { method, body: JSON.stringify(data) });
 
-function toast(s) {
-  const t = $('#toast');
-  t.textContent = s;
-  t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 4200);
+let toastTimeout;
+
+function toast(message) {
+  const element = $('#toast');
+  if (!element) return;
+
+  element.textContent = message;
+  element.classList.add('show');
+
+  clearTimeout(toastTimeout);
+  toastTimeout = setTimeout(() => {
+    element.classList.remove('show');
+  }, 5000);
 }
 
 function go(page) {
   current = page;
-  history.pushState({}, '', page === 'home' ? '/' : `/${page}`);
+  history.pushState(
+    {},
+    '',
+    page === 'home' ? '/' : `/${page}`
+  );
   render();
   window.scrollTo(0, 0);
 }
@@ -54,12 +150,29 @@ function syncNav() {
 }
 
 async function refreshUser() {
+  if (!session?.access_token) {
+    me = null;
+    syncNav();
+    return null;
+  }
+
   try {
-    const result = await api('/me');
+    let result = await api('/me');
+
+    if (
+      !result.user &&
+      session?.refresh_token &&
+      await refreshOnce()
+    ) {
+      result = await api('/me', {}, false);
+    }
+
     me = result.user || null;
-  } catch {
+  } catch (error) {
+    console.error('Could not load user:', error);
     me = null;
   }
+
   syncNav();
   return me;
 }
@@ -75,53 +188,83 @@ window.addEventListener('popstate', () => {
   render();
 });
 
-document.querySelectorAll('[data-page]').forEach(b =>
-  b.addEventListener('click', () => go(b.dataset.page))
-);
+document.querySelectorAll('[data-page]').forEach(b => {
+  b.addEventListener('click', () => go(b.dataset.page));
+});
 
 $('#logoutNav').addEventListener('click', async () => {
   try {
     await post('/logout', {});
-    me = null;
-    syncNav();
-    go('home');
-    toast('Logged out.');
-  } catch (e) {
-    toast(e.message);
+  } catch (error) {
+    console.warn('Logout request failed:', error);
   }
+
+  saveSession(null);
+  me = null;
+  syncNav();
+  go('home');
+  toast('Logged out.');
 });
 
 function formHtml() {
   return `
     <div class="panel">
       <h2>SEND A QUESTION!</h2>
+
       <p class="subtle">
-        No account needed. All questions are reviewed before they appear publicly.
+        No account needed. All questions are reviewed
+        before they appear publicly.
       </p>
 
       <form id="askForm">
         ${me ? '' : `
           <label>YOUR NAME *</label>
-          <input name="name" required maxlength="60" minlength="2"
-            placeholder="What should I call you?">
+          <input
+            name="name"
+            required
+            maxlength="60"
+            minlength="2"
+            placeholder="What should I call you?"
+          >
         `}
 
         <label>SUBJECT *</label>
-        <input name="title" required minlength="4" maxlength="130"
-          placeholder="What's the situation?">
+        <input
+          name="title"
+          required
+          minlength="4"
+          maxlength="130"
+          placeholder="What's the situation?"
+        >
 
         <label>YOUR QUESTION *</label>
-        <textarea name="body" required minlength="8" maxlength="4000"
-          placeholder="Give me the details..."></textarea>
+        <textarea
+          name="body"
+          required
+          minlength="8"
+          maxlength="4000"
+          placeholder="Give me the details..."
+        ></textarea>
 
         <label>WHO GETS TO SEE IT?</label>
+
         <div class="choice">
           <label>
-            <input type="radio" name="visibility" value="public" checked>
+            <input
+              type="radio"
+              name="visibility"
+              value="public"
+              checked
+            >
             🌐 PUBLIC
           </label>
+
           <label>
-            <input type="radio" name="visibility" value="private">
+            <input
+              type="radio"
+              name="visibility"
+              value="private"
+            >
             🔒 PRIVATE
           </label>
         </div>
@@ -133,7 +276,11 @@ function formHtml() {
         </p>
 
         <div class="honeypot">
-          <input name="website" tabindex="-1" autocomplete="off">
+          <input
+            name="website"
+            tabindex="-1"
+            autocomplete="off"
+          >
         </div>
 
         <button class="action" type="submit">
@@ -148,20 +295,30 @@ function home() {
   app.innerHTML = `
     <section class="hero">
       <div>
-        <div class="eyebrow">★ THE UNOFFICIAL HELP DESK ★</div>
+        <div class="eyebrow">
+          ★ THE UNOFFICIAL HELP DESK ★
+        </div>
+
         <h1>ASK <span>AIHAM!</span></h1>
+
         <p class="lead">
           I left the store.<br>
           <strong>The questions followed me.</strong><br>
           Ask anything. I'll answer when I can.
         </p>
-        <div class="stamp">NO QUESTION TOO WEIRD!</div>
+
+        <div class="stamp">
+          NO QUESTION TOO WEIRD!
+        </div>
       </div>
+
       ${formHtml()}
     </section>
 
     <div class="toolbar">
-      <button id="browse">SEE ANSWERED QUESTIONS →</button>
+      <button id="browse">
+        SEE ANSWERED QUESTIONS →
+      </button>
     </div>
   `;
 
@@ -183,19 +340,32 @@ async function submitQuestion(e) {
 
     if (result.token) {
       const url =
-        `${location.origin}/question/${result.id}?token=${encodeURIComponent(result.token)}`;
+        `${location.origin}/question/${result.id}` +
+        `?token=${encodeURIComponent(result.token)}`;
 
       app.innerHTML = `
         <div class="container">
-          <h1 class="page-title">CARD DELIVERED!</h1>
+          <h1 class="page-title">
+            CARD DELIVERED!
+          </h1>
+
           <div class="panel">
             <h2>KEEP YOUR SECRET LINK</h2>
+
             <p>
-              Save this link now. Without an account, it's the only way
-              to revisit your question and reply to Aiham.
+              Save this link now. Without an account,
+              it's the only way to revisit your question
+              and reply to Aiham.
             </p>
-            <div class="secret" id="secretUrl">${esc(url)}</div>
-            <button class="action" id="copy">COPY LINK</button>
+
+            <div class="secret" id="secretUrl">
+              ${esc(url)}
+            </div>
+
+            <button class="action" id="copy">
+              COPY LINK
+            </button>
+
             <p class="subtle">
               Anyone with this link can read this conversation.
               Don't share it if the question is private.
@@ -210,7 +380,7 @@ async function submitQuestion(e) {
           .catch(() => toast('Copy the link manually.'));
     } else {
       toast('Question submitted!');
-      go('mine');
+      go(me ? 'mine' : 'home');
     }
   } catch (e) {
     toast(e.message);
@@ -220,20 +390,34 @@ async function submitQuestion(e) {
 
 async function archive() {
   app.innerHTML = `
-    <h1 class="page-title">THE PUBLIC ARCHIVE</h1>
-    <p class="muted">Loading calling cards...</p>
+    <h1 class="page-title">
+      THE PUBLIC ARCHIVE
+    </h1>
+
+    <p class="muted">
+      Loading calling cards...
+    </p>
   `;
 
   try {
     const data = await api('/questions');
 
     app.innerHTML = `
-      <h1 class="page-title">THE PUBLIC ARCHIVE</h1>
+      <h1 class="page-title">
+        THE PUBLIC ARCHIVE
+      </h1>
+
       <p class="muted">
-        Answered and approved questions. Nothing private appears here.
+        Answered and approved questions.
+        Nothing private appears here.
       </p>
-      <input class="search" id="search"
-        placeholder="Search the archive...">
+
+      <input
+        class="search"
+        id="search"
+        placeholder="Search the archive..."
+      >
+
       <div class="grid" id="cards"></div>
     `;
 
@@ -252,19 +436,29 @@ async function archive() {
       cards.innerHTML = items.length
         ? items.map(q => `
           <article class="qcard" data-id="${q.id}">
-            <span class="tag">PUBLIC CALLING CARD #${q.id}</span>
+            <span class="tag">
+              PUBLIC CALLING CARD #${q.id}
+            </span>
+
             <h3>${esc(q.title)}</h3>
+
             <p>${esc(q.body.slice(0, 160))}</p>
+
             <small>
-              BY ${esc(q.name)} · ${esc(q.created_at.slice(0, 10))}
+              BY ${esc(q.name)} ·
+              ${esc(q.created_at.slice(0, 10))}
             </small>
           </article>
         `).join('')
-        : '<div class="empty">No questions found. Be the first!</div>';
+        : `
+          <div class="empty">
+            No questions found. Be the first!
+          </div>
+        `;
 
-      cards.querySelectorAll('[data-id]').forEach(c =>
-        c.onclick = () => go('question/' + c.dataset.id)
-      );
+      cards.querySelectorAll('[data-id]').forEach(c => {
+        c.onclick = () => go('question/' + c.dataset.id);
+      });
     }
 
     $('#search').oninput = draw;
@@ -280,13 +474,20 @@ async function mine() {
     return;
   }
 
-  app.innerHTML = '<h1 class="page-title">MY QUESTIONS</h1>';
+  app.innerHTML = `
+    <h1 class="page-title">
+      MY QUESTIONS
+    </h1>
+  `;
 
   try {
     const { questions } = await api('/mine');
 
     app.innerHTML = `
-      <h1 class="page-title">MY QUESTIONS</h1>
+      <h1 class="page-title">
+        MY QUESTIONS
+      </h1>
+
       <div class="grid">
         ${questions.length
           ? questions.map(q => `
@@ -295,17 +496,22 @@ async function mine() {
                 ${esc(q.visibility.toUpperCase())} ·
                 ${esc(q.status.toUpperCase())}
               </span>
+
               <h3>${esc(q.title)}</h3>
             </article>
           `).join('')
-          : '<div class="empty">No questions yet. Ask one!</div>'
+          : `
+            <div class="empty">
+              No questions yet. Ask one!
+            </div>
+          `
         }
       </div>
     `;
 
-    app.querySelectorAll('[data-id]').forEach(c =>
-      c.onclick = () => go('question/' + c.dataset.id)
-    );
+    app.querySelectorAll('[data-id]').forEach(c => {
+      c.onclick = () => go('question/' + c.dataset.id);
+    });
   } catch (e) {
     toast(e.message);
   }
@@ -313,51 +519,80 @@ async function mine() {
 
 async function question() {
   const id = current.split('/')[1];
-  const token = new URLSearchParams(location.search).get('token') || '';
+  const token =
+    new URLSearchParams(location.search).get('token') || '';
 
-  app.innerHTML = '<p>Loading conversation...</p>';
+  app.innerHTML = `
+    <p>Loading conversation...</p>
+  `;
 
   try {
     const { question: q, canReply } =
-      await api(`/questions/${id}?token=${encodeURIComponent(token)}`);
+      await api(
+        `/questions/${id}?token=${encodeURIComponent(token)}`
+      );
 
     app.innerHTML = `
       <div class="container">
         <div class="eyebrow">
-          ${esc(q.visibility.toUpperCase())} CALLING CARD #${q.id}
+          ${esc(q.visibility.toUpperCase())}
+          CALLING CARD #${q.id}
         </div>
 
-        <h1 class="page-title">${esc(q.title)}</h1>
+        <h1 class="page-title">
+          ${esc(q.title)}
+        </h1>
 
         <div class="thread">
-          <span class="tag">${esc(q.name)}</span>
+          <span class="tag">
+            ${esc(q.name)}
+          </span>
+
           <p>${esc(q.body)}</p>
         </div>
 
         <h2>THE CONVERSATION</h2>
 
         ${q.replies.map(r => `
-          <div class="thread ${r.author === 'Aiham' ? 'aiham' : ''}">
+          <div class="thread ${
+            r.author === 'Aiham' ? 'aiham' : ''
+          }">
             <strong>${esc(r.author)}</strong>
             <p>${esc(r.body)}</p>
             <small>${esc(r.created_at)}</small>
           </div>
-        `).join('') ||
-          '<p class="muted">Aiham hasn’t replied yet. Check back soon.</p>'
-        }
+        `).join('') || `
+          <p class="muted">
+            Aiham hasn't replied yet.
+            Check back soon.
+          </p>
+        `}
 
         ${canReply ? `
           <form id="replyForm" class="panel">
             <h2>YOUR REPLY</h2>
-            <textarea name="body" required minlength="2"
+
+            <textarea
+              name="body"
+              required
+              minlength="2"
               maxlength="4000"
-              placeholder="Keep the conversation going..."></textarea>
-            <button class="action">SEND REPLY</button>
+              placeholder="Keep the conversation going..."
+            ></textarea>
+
+            <button class="action">
+              SEND REPLY
+            </button>
           </form>
         ` : ''}
 
         ${q.visibility === 'public' && !me?.admin
-          ? '<p class="hint">Public follow-up replies appear after moderation.</p>'
+          ? `
+            <p class="hint">
+              Public follow-up replies appear
+              after moderation.
+            </p>
+          `
           : ''
         }
       </div>
@@ -366,6 +601,12 @@ async function question() {
     if (canReply) {
       $('#replyForm').onsubmit = async e => {
         e.preventDefault();
+
+        const button =
+          $('button[type=submit]', e.target) ||
+          $('button', e.target);
+
+        button.disabled = true;
 
         try {
           await post(`/questions/${id}/replies`, {
@@ -377,6 +618,7 @@ async function question() {
           render();
         } catch (x) {
           toast(x.message);
+          button.disabled = false;
         }
       };
     }
@@ -384,8 +626,10 @@ async function question() {
     app.innerHTML = `
       <div class="empty">
         ${esc(e.message)}
+
         <p>
-          For private guest questions, open your original secret link.
+          For private guest questions,
+          open your original secret link.
         </p>
       </div>
     `;
@@ -395,23 +639,38 @@ async function question() {
 function auth() {
   app.innerHTML = `
     <div class="authbox">
-      <h1 class="page-title">JOIN THE CREW</h1>
+      <h1 class="page-title">
+        JOIN THE CREW
+      </h1>
 
       <div class="panel">
-        <h2 id="authTitle">LOG IN</h2>
+        <h2 id="authTitle">
+          LOG IN
+        </h2>
 
         <form id="authForm">
           <div id="nameField" hidden>
             <label>DISPLAY NAME</label>
-            <input name="name" placeholder="Your name">
+            <input
+              name="name"
+              placeholder="Your name"
+            >
           </div>
 
           <label>EMAIL</label>
-          <input type="email" name="email" required>
+          <input
+            type="email"
+            name="email"
+            required
+          >
 
           <label>PASSWORD</label>
-          <input type="password" name="password"
-            required minlength="10">
+          <input
+            type="password"
+            name="password"
+            required
+            minlength="10"
+          >
 
           <button class="action" type="submit">
             LET ME IN ↗
@@ -425,8 +684,9 @@ function auth() {
         </p>
 
         <p class="subtle">
-          Accounts are optional. They save your name and
-          let you track questions across devices.
+          Accounts are optional.
+          They save your name and let you track
+          questions across devices.
         </p>
       </div>
     </div>
@@ -463,25 +723,31 @@ function auth() {
         data
       );
 
+      if (!result.session?.access_token) {
+        toast(
+          register && result.needsConfirmation
+            ? 'Account created! Confirm your email, then log in.'
+            : 'No login session was returned. Please try again.'
+        );
+
+        button.disabled = false;
+        return;
+      }
+
+      saveSession(result.session);
       await refreshUser();
 
       if (!me) {
-        if (register) {
-          toast(
-            'Registration submitted. Check your email for a confirmation link, then log in.'
-          );
-        } else {
-          toast(
-            'Login was submitted, but no active session was found. Please try again.'
-          );
-        }
+        toast(
+          'Login succeeded, but your profile could not be loaded.'
+        );
 
         button.disabled = false;
         return;
       }
 
       go(me.admin ? 'admin' : 'mine');
-      toast('Welcome!');
+      toast(`Welcome, ${me.name}!`);
     } catch (x) {
       toast(x.message);
       button.disabled = false;
@@ -496,7 +762,10 @@ async function admin() {
   }
 
   app.innerHTML = `
-    <h1 class="page-title">AIHAM’S INBOX</h1>
+    <h1 class="page-title">
+      AIHAM'S INBOX
+    </h1>
+
     <p>Loading...</p>
   `;
 
@@ -505,7 +774,9 @@ async function admin() {
       await api('/admin/questions');
 
     app.innerHTML = `
-      <h1 class="page-title">AIHAM’S INBOX</h1>
+      <h1 class="page-title">
+        AIHAM'S INBOX
+      </h1>
 
       <p class="muted">
         ${questions.filter(q => q.status === 'pending').length}
@@ -520,7 +791,9 @@ async function admin() {
         ${questions.map(q => `
           <article class="qcard">
             <span class="tag">
-              #${q.id} · ${esc(q.visibility)} · ${esc(q.status)}
+              #${q.id} ·
+              ${esc(q.visibility)} ·
+              ${esc(q.status)}
             </span>
 
             <h3>${esc(q.title)}</h3>
@@ -528,19 +801,30 @@ async function admin() {
             <small>${esc(q.name)}</small>
 
             <div class="toolbar">
-              <button data-open="${q.id}">OPEN</button>
+              <button data-open="${q.id}">
+                OPEN
+              </button>
 
               ${q.visibility === 'public' ? `
-                <button data-status="published" data-id="${q.id}">
+                <button
+                  data-status="published"
+                  data-id="${q.id}"
+                >
                   PUBLISH
                 </button>
               ` : ''}
 
-              <button data-status="hidden" data-id="${q.id}">
+              <button
+                data-status="hidden"
+                data-id="${q.id}"
+              >
                 HIDE
               </button>
 
-              <button class="danger" data-delete="${q.id}">
+              <button
+                class="danger"
+                data-delete="${q.id}"
+              >
                 DELETE
               </button>
             </div>
@@ -561,23 +845,31 @@ async function admin() {
             <small>${esc(r.author)}</small>
 
             <div class="toolbar">
-              <button data-approve="${r.id}">APPROVE</button>
-              <button class="danger" data-delreply="${r.id}">
+              <button data-approve="${r.id}">
+                APPROVE
+              </button>
+
+              <button
+                class="danger"
+                data-delreply="${r.id}"
+              >
                 DELETE
               </button>
             </div>
           </article>
-        `).join('') ||
-          '<div class="empty">All caught up!</div>'
-        }
+        `).join('') || `
+          <div class="empty">
+            All caught up!
+          </div>
+        `}
       </div>
     `;
 
-    app.querySelectorAll('[data-open]').forEach(b =>
-      b.onclick = () => go('question/' + b.dataset.open)
-    );
+    app.querySelectorAll('[data-open]').forEach(b => {
+      b.onclick = () => go('question/' + b.dataset.open);
+    });
 
-    app.querySelectorAll('[data-status]').forEach(b =>
+    app.querySelectorAll('[data-status]').forEach(b => {
       b.onclick = async () => {
         try {
           await post(
@@ -585,29 +877,34 @@ async function admin() {
             { status: b.dataset.status },
             'PATCH'
           );
+
           admin();
         } catch (e) {
           toast(e.message);
         }
-      }
-    );
+      };
+    });
 
-    app.querySelectorAll('[data-delete]').forEach(b =>
+    app.querySelectorAll('[data-delete]').forEach(b => {
       b.onclick = async () => {
-        if (!confirm('Permanently delete this question?')) return;
+        if (!confirm('Permanently delete this question?')) {
+          return;
+        }
 
         try {
-          await api('/admin/questions/' + b.dataset.delete, {
-            method: 'DELETE'
-          });
+          await api(
+            '/admin/questions/' + b.dataset.delete,
+            { method: 'DELETE' }
+          );
+
           admin();
         } catch (e) {
           toast(e.message);
         }
-      }
-    );
+      };
+    });
 
-    app.querySelectorAll('[data-approve]').forEach(b =>
+    app.querySelectorAll('[data-approve]').forEach(b => {
       b.onclick = async () => {
         try {
           await post(
@@ -615,25 +912,28 @@ async function admin() {
             { approved: true },
             'PATCH'
           );
+
           admin();
         } catch (e) {
           toast(e.message);
         }
-      }
-    );
+      };
+    });
 
-    app.querySelectorAll('[data-delreply]').forEach(b =>
+    app.querySelectorAll('[data-delreply]').forEach(b => {
       b.onclick = async () => {
         try {
-          await api('/admin/replies/' + b.dataset.delreply, {
-            method: 'DELETE'
-          });
+          await api(
+            '/admin/replies/' + b.dataset.delreply,
+            { method: 'DELETE' }
+          );
+
           admin();
         } catch (e) {
           toast(e.message);
         }
-      }
-    );
+      };
+    });
   } catch (e) {
     toast(e.message);
   }
