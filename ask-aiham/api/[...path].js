@@ -1,1035 +1,740 @@
 
-import {createClient} from '@supabase/supabase-js';
+import { createClient } from '@supabase/supabase-js';
+import {
+  createHash,
+  randomBytes,
+  timingSafeEqual
+} from 'node:crypto';
 
-let me = null;
-let current = 'home';
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY;
+const SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 
-const SESSION_KEY = 'ask-aiham-session';
+const configured = Boolean(
+  SUPABASE_URL &&
+  PUBLISHABLE_KEY &&
+  SECRET_KEY
+);
 
-const $ = (selector, root = document) =>
-  root.querySelector(selector);
-
-const esc = value =>
-  String(value ?? '').replace(/[&<>"']/g, char => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;'
-  }[char]));
-
-let session = null;
-
-try {
-  session = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
-} catch {
-  localStorage.removeItem(SESSION_KEY);
-}
-
-function saveSession(value) {
-  session = value;
-
-  if (value) {
-    localStorage.setItem(SESSION_KEY, JSON.stringify(value));
-  } else {
-    localStorage.removeItem(SESSION_KEY);
-  }
-}
-
-function toast(message) {
-  const element = $('#toast');
-  if (!element) return;
-
-  element.textContent = message;
-  element.classList.add('show');
-
-  clearTimeout(toast.timer);
-
-  toast.timer = setTimeout(() => {
-    element.classList.remove('show');
-  }, 5000);
-}
-
-async function refreshSession() {
-  if (!session?.refresh_token) {
-    saveSession(null);
-    return false;
-  }
-
-  try {
-    const response = await fetch('/api/refresh', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        refresh_token: session.refresh_token
-      })
-    });
-
-    const data = await response.json();
-
-    if (!response.ok || !data.session?.access_token) {
-      saveSession(null);
-      return false;
+function makeClient(key) {
+  return createClient(SUPABASE_URL, key, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false
     }
-
-    saveSession(data.session);
-    return true;
-  } catch {
-    return false;
-  }
+  });
 }
 
-let refreshPromise = null;
+const hash = value =>
+  createHash('sha256')
+    .update(value)
+    .digest('hex');
 
-async function refreshOnce() {
-  if (!refreshPromise) {
-    refreshPromise = refreshSession().finally(() => {
-      refreshPromise = null;
-    });
-  }
+const clean = (value, max = 4000) =>
+  typeof value === 'string'
+    ? value.trim().slice(0, max)
+    : '';
 
-  return refreshPromise;
+function sendError(res, status, message) {
+  return res.status(status).json({ error: message });
 }
 
-async function api(path, options = {}, retry = true) {
-  const headers = {
-    'Content-Type': 'application/json',
-    ...(options.headers || {})
+function unwrap(result) {
+  if (result.error) {
+    throw result.error;
+  }
+  return result.data;
+}
+
+function matchesToken(token, storedHash) {
+  if (!token || !storedHash) return false;
+
+  const a = Buffer.from(hash(token), 'hex');
+  const b = Buffer.from(storedHash, 'hex');
+
+  return (
+    a.length === b.length &&
+    timingSafeEqual(a, b)
+  );
+}
+
+function getPath(req) {
+  const pathname = new URL(
+    req.url,
+    'https://localhost'
+  ).pathname;
+
+  return (
+    pathname
+      .replace(/^\/api(?=\/|$)/, '')
+      .replace(/\/+$/, '') || '/'
+  );
+}
+
+function getBody(req) {
+  if (!req.body) return {};
+
+  if (typeof req.body === 'string') {
+    try {
+      return JSON.parse(req.body);
+    } catch {
+      return {};
+    }
+  }
+
+  return req.body;
+}
+
+function getToken(req) {
+  const authorization = req.headers.authorization || '';
+
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+
+  return match ? match[1].trim() : '';
+}
+
+function validEmail(email) {
+  return (
+    email.length <= 160 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  );
+}
+
+function sessionResponse(session) {
+  if (!session) return null;
+
+  return {
+    access_token: session.access_token,
+    refresh_token: session.refresh_token
   };
-
-  if (session?.access_token) {
-    headers.Authorization = `Bearer ${session.access_token}`;
-  }
-
-  const response = await fetch('/api' + path, {
-    ...options,
-    headers,
-    cache: 'no-store'
-  });
-
-  if (
-    response.status === 401 &&
-    retry &&
-    session?.refresh_token &&
-    path !== '/login' &&
-    path !== '/register' &&
-    path !== '/refresh'
-  ) {
-    const refreshed = await refreshOnce();
-
-    if (refreshed) {
-      return api(path, options, false);
-    }
-  }
-
-  let data;
-
-  try {
-    data = await response.json();
-  } catch {
-    throw new Error('The server returned an invalid response.');
-  }
-
-  if (!response.ok) {
-    throw new Error(data.error || `Request failed (${response.status})`);
-  }
-
-  return data;
 }
 
-const post = (path, data, method = 'POST') =>
-  api(path, {
-    method,
-    body: JSON.stringify(data)
-  });
+export default async function handler(req, res) {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Type', 'application/json');
 
-function syncNav() {
-  $('#adminNav').hidden = !me?.admin;
-  $('#mineNav').hidden = !me;
-  $('#authNav').hidden = !!me;
-  $('#logoutNav').hidden = !me;
-}
-
-async function refreshUser() {
-  if (!session?.access_token) {
-    me = null;
-    syncNav();
-    return null;
+  if (!configured) {
+    return sendError(
+      res,
+      503,
+      'Server not configured. Check Vercel environment variables.'
+    );
   }
 
+  const path = getPath(req);
+  const method = req.method;
+  const body = getBody(req);
+  const token = getToken(req);
+
   try {
-    const result = await api('/me');
-    me = result.user || null;
+    const sb = makeClient(SECRET_KEY);
+    const authClient = makeClient(PUBLISHABLE_KEY);
 
-    if (!me && session?.refresh_token) {
-      const refreshed = await refreshOnce();
+    let user = null;
+    let profile = null;
+    let isAdmin = false;
 
-      if (refreshed) {
-        const retry = await api('/me');
-        me = retry.user || null;
+    // AUTHENTICATE REQUEST
+
+    if (token) {
+      const { data, error } =
+        await authClient.auth.getUser(token);
+
+      if (!error && data?.user) {
+        user = data.user;
+
+        profile = unwrap(
+          await sb
+            .from('profiles')
+            .select('display_name')
+            .eq('id', user.id)
+            .maybeSingle()
+        );
+
+        const adminRecord = unwrap(
+          await sb
+            .from('admins')
+            .select('user_id')
+            .eq('user_id', user.id)
+            .maybeSingle()
+        );
+
+        isAdmin = Boolean(adminRecord);
       }
     }
-  } catch (error) {
-    console.error('Could not load user:', error);
-    me = null;
-  }
 
-  syncNav();
-  return me;
-}
-
-function go(page) {
-  current = page;
-
-  const path = page === 'home' ? '/' : '/' + page;
-
-  history.pushState({}, '', path);
-  render();
-  window.scrollTo(0, 0);
-}
-
-window.addEventListener('popstate', () => {
-  current = location.pathname.slice(1) || 'home';
-  render();
-});
-
-document.querySelectorAll('[data-page]').forEach(button => {
-  button.addEventListener('click', () => {
-    go(button.dataset.page);
-  });
-});
-
-$('#logoutNav').addEventListener('click', async () => {
-  try {
-    await post('/logout', {});
-  } catch (error) {
-    console.warn('Logout request failed:', error);
-  }
-
-  saveSession(null);
-  me = null;
-
-  syncNav();
-  go('home');
-
-  toast('Logged out!');
-});
-
-async function init() {
-  await refreshUser();
-
-  current = location.pathname.slice(1) || 'home';
-  render();
-}
-
-function formHtml() {
-  return `
-    <div class="panel">
-      <h2>SEND A QUESTION!</h2>
-
-      <p class="subtle">
-        No account needed. All questions are reviewed
-        before they appear publicly.
-      </p>
-
-      <form id="askForm">
-        ${me ? '' : `
-          <label>YOUR NAME *</label>
-          <input
-            name="name"
-            required
-            maxlength="60"
-            minlength="2"
-            placeholder="What should I call you?"
-          >
-        `}
-
-        <label>SUBJECT *</label>
-        <input
-          name="title"
-          required
-          minlength="4"
-          maxlength="130"
-          placeholder="What's the situation?"
-        >
-
-        <label>YOUR QUESTION *</label>
-        <textarea
-          name="body"
-          required
-          minlength="8"
-          maxlength="4000"
-          placeholder="Give me the details..."
-        ></textarea>
-
-        <label>WHO GETS TO SEE IT?</label>
-
-        <div class="choice">
-          <label>
-            <input
-              type="radio"
-              name="visibility"
-              value="public"
-              checked
-            >
-            🌐 PUBLIC
-          </label>
-
-          <label>
-            <input
-              type="radio"
-              name="visibility"
-              value="private"
-            >
-            🔒 PRIVATE
-          </label>
-        </div>
-
-        <p class="subtle">
-          Public: visible after Aiham approves it.
-          Private: only you and Aiham can read it.
-          Guest access uses a secret link.
-        </p>
-
-        <div class="honeypot">
-          <input
-            name="website"
-            tabindex="-1"
-            autocomplete="off"
-          >
-        </div>
-
-        <button class="action" type="submit">
-          SEND CALLING CARD ↗
-        </button>
-      </form>
-    </div>
-  `;
-}
-
-function home() {
-  app.innerHTML = `
-    <section class="hero">
-      <div>
-        <div class="eyebrow">
-          ★ THE UNOFFICIAL HELP DESK ★
-        </div>
-
-        <h1>ASK <span>AIHAM!</span></h1>
-
-        <p class="lead">
-          I left the store.<br>
-          <strong>The questions followed me.</strong><br>
-          Ask anything. I'll answer when I can.
-        </p>
-
-        <div class="stamp">
-          NO QUESTION TOO WEIRD!
-        </div>
-      </div>
-
-      ${formHtml()}
-    </section>
-
-    <div class="toolbar">
-      <button id="browse">
-        SEE ANSWERED QUESTIONS →
-      </button>
-    </div>
-  `;
-
-  $('#browse').onclick = () => go('archive');
-  $('#askForm').onsubmit = submitQuestion;
-}
-
-async function submitQuestion(event) {
-  event.preventDefault();
-
-  const form = event.target;
-  const data = Object.fromEntries(new FormData(form));
-  const button = $('button[type=submit]', form);
-
-  button.disabled = true;
-
-  try {
-    const result = await post('/questions', data);
-
-    if (result.token) {
-      const url =
-        `${location.origin}/question/${result.id}` +
-        `?token=${encodeURIComponent(result.token)}`;
-
-      app.innerHTML = `
-        <div class="container">
-          <h1 class="page-title">
-            CARD DELIVERED!
-          </h1>
-
-          <div class="panel">
-            <h2>KEEP YOUR SECRET LINK</h2>
-
-            <p>
-              Save this link now. Without an account,
-              it's the only way to revisit your question
-              and reply to Aiham.
-            </p>
-
-            <div class="secret" id="secretUrl">
-              ${esc(url)}
-            </div>
-
-            <button class="action" id="copy">
-              COPY LINK
-            </button>
-
-            <p class="subtle">
-              Anyone with this link can read this conversation.
-              Don't share it if the question is private.
-            </p>
-          </div>
-        </div>
-      `;
-
-      $('#copy').onclick = async () => {
-        try {
-          await navigator.clipboard.writeText(url);
-          toast('Link copied!');
-        } catch {
-          toast('Copy the link manually.');
+    const me = user
+      ? {
+          id: user.id,
+          name:
+            profile?.display_name ||
+            user.user_metadata?.display_name ||
+            user.email,
+          email: user.email,
+          admin: isAdmin
         }
-      };
+      : null;
 
-      return;
+    // CURRENT USER
+
+    if (path === '/me' && method === 'GET') {
+      return res.json({ user: me });
     }
 
-    toast('Question submitted!');
+    // REGISTER
 
-    if (me) {
-      go('mine');
-    } else {
-      go('home');
-    }
-  } catch (error) {
-    toast(error.message);
-    button.disabled = false;
-  }
-}
+    if (path === '/register' && method === 'POST') {
+      const name = clean(body.name, 60);
+      const email = clean(body.email, 160).toLowerCase();
+      const password = body.password;
 
-async function archive() {
-  app.innerHTML = `
-    <h1 class="page-title">
-      THE PUBLIC ARCHIVE
-    </h1>
+      if (
+        name.length < 2 ||
+        !validEmail(email) ||
+        typeof password !== 'string' ||
+        password.length < 10
+      ) {
+        return sendError(
+          res,
+          400,
+          'Enter a valid name, email, and password of at least 10 characters.'
+        );
+      }
 
-    <p class="muted">
-      Loading calling cards...
-    </p>
-  `;
+      const { data, error } =
+        await authClient.auth.signUp({
+          email,
+          password,
+          options: {
+            data: {
+              display_name: name
+            }
+          }
+        });
 
-  try {
-    const data = await api('/questions');
+      if (error) {
+        return sendError(res, 400, error.message);
+      }
 
-    app.innerHTML = `
-      <h1 class="page-title">
-        THE PUBLIC ARCHIVE
-      </h1>
+      if (data.user && data.session) {
+        unwrap(
+          await sb
+            .from('profiles')
+            .upsert({
+              id: data.user.id,
+              display_name: name
+            })
+        );
+      }
 
-      <p class="muted">
-        Answered and approved questions.
-        Nothing private appears here.
-      </p>
-
-      <input
-        class="search"
-        id="search"
-        placeholder="Search the archive..."
-      >
-
-      <div class="grid" id="cards"></div>
-    `;
-
-    const cards = $('#cards');
-
-    function draw() {
-      const term = $('#search').value.toLowerCase();
-
-      const items = data.questions.filter(question =>
-        [
-          question.title,
-          question.body,
-          question.name
-        ].join(' ').toLowerCase().includes(term)
-      );
-
-      cards.innerHTML = items.length
-        ? items.map(question => `
-          <article
-            class="qcard"
-            data-id="${question.id}"
-          >
-            <span class="tag">
-              PUBLIC CALLING CARD #${question.id}
-            </span>
-
-            <h3>${esc(question.title)}</h3>
-
-            <p>
-              ${esc(question.body.slice(0, 160))}
-            </p>
-
-            <small>
-              BY ${esc(question.name)} ·
-              ${esc(question.created_at.slice(0, 10))}
-            </small>
-          </article>
-        `).join('')
-        : `
-          <div class="empty">
-            No questions found. Be the first!
-          </div>
-        `;
-
-      cards.querySelectorAll('[data-id]').forEach(card => {
-        card.onclick = () => {
-          go('question/' + card.dataset.id);
-        };
+      return res.json({
+        ok: true,
+        needsConfirmation: !data.session,
+        session: sessionResponse(data.session)
       });
     }
 
-    $('#search').oninput = draw;
-    draw();
-  } catch (error) {
-    app.innerHTML = `
-      <div class="empty">
-        ${esc(error.message)}
-      </div>
-    `;
-  }
-}
+    // LOGIN
 
-async function mine() {
-  if (!me) {
-    go('auth');
-    return;
-  }
+    if (path === '/login' && method === 'POST') {
+      const email = clean(body.email, 160).toLowerCase();
+      const password = body.password || '';
 
-  app.innerHTML = `
-    <h1 class="page-title">
-      MY QUESTIONS
-    </h1>
-  `;
+      const { data, error } =
+        await authClient.auth.signInWithPassword({
+          email,
+          password
+        });
 
-  try {
-    const { questions } = await api('/mine');
+      if (error) {
+        return sendError(res, 401, error.message);
+      }
 
-    app.innerHTML = `
-      <h1 class="page-title">
-        MY QUESTIONS
-      </h1>
+      if (!data.session) {
+        return sendError(
+          res,
+          401,
+          'No session returned. Check email confirmation.'
+        );
+      }
 
-      <div class="grid">
-        ${questions.length
-          ? questions.map(question => `
-            <article
-              class="qcard"
-              data-id="${question.id}"
-            >
-              <span class="tag">
-                ${esc(question.visibility.toUpperCase())} ·
-                ${esc(question.status.toUpperCase())}
-              </span>
-
-              <h3>${esc(question.title)}</h3>
-            </article>
-          `).join('')
-          : `
-            <div class="empty">
-              No questions yet. Ask one!
-            </div>
-          `
-        }
-      </div>
-    `;
-
-    app.querySelectorAll('[data-id]').forEach(card => {
-      card.onclick = () => {
-        go('question/' + card.dataset.id);
-      };
-    });
-  } catch (error) {
-    toast(error.message);
-  }
-}
-
-async function question() {
-  const id = current.split('/')[1];
-
-  const token =
-    new URLSearchParams(location.search).get('token') || '';
-
-  app.innerHTML = `
-    <p>Loading conversation...</p>
-  `;
-
-  try {
-    const result = await api(
-      `/questions/${id}?token=${encodeURIComponent(token)}`
-    );
-
-    const q = result.question;
-    const canReply = result.canReply;
-
-    app.innerHTML = `
-      <div class="container">
-        <div class="eyebrow">
-          ${esc(q.visibility.toUpperCase())}
-          CALLING CARD #${q.id}
-        </div>
-
-        <h1 class="page-title">
-          ${esc(q.title)}
-        </h1>
-
-        <div class="thread">
-          <span class="tag">
-            ${esc(q.name)}
-          </span>
-
-          <p>${esc(q.body)}</p>
-        </div>
-
-        <h2>THE CONVERSATION</h2>
-
-        ${q.replies.map(reply => `
-          <div class="thread ${
-            reply.author === 'Aiham' ? 'aiham' : ''
-          }">
-            <strong>
-              ${esc(reply.author)}
-            </strong>
-
-            <p>${esc(reply.body)}</p>
-
-            <small>
-              ${esc(reply.created_at)}
-            </small>
-          </div>
-        `).join('') || `
-          <p class="muted">
-            Aiham hasn't replied yet.
-            Check back soon.
-          </p>
-        `}
-
-        ${canReply ? `
-          <form id="replyForm" class="panel">
-            <h2>YOUR REPLY</h2>
-
-            <textarea
-              name="body"
-              required
-              minlength="2"
-              maxlength="4000"
-              placeholder="Keep the conversation going..."
-            ></textarea>
-
-            <button class="action">
-              SEND REPLY
-            </button>
-          </form>
-        ` : ''}
-
-        ${
-          q.visibility === 'public' && !me?.admin
-            ? `
-              <p class="hint">
-                Public follow-up replies appear
-                after moderation.
-              </p>
-            `
-            : ''
-        }
-      </div>
-    `;
-
-    if (canReply) {
-      $('#replyForm').onsubmit = async event => {
-        event.preventDefault();
-
-        const form = event.target;
-        const button = $('button', form);
-
-        button.disabled = true;
-
-        try {
-          await post(`/questions/${id}/replies`, {
-            body: form.elements.namedItem('body').value,
-            token
-          });
-
-          toast('Reply sent!');
-          render();
-        } catch (error) {
-          toast(error.message);
-          button.disabled = false;
-        }
-      };
+      return res.json({
+        ok: true,
+        session: sessionResponse(data.session)
+      });
     }
-  } catch (error) {
-    app.innerHTML = `
-      <div class="empty">
-        ${esc(error.message)}
 
-        <p>
-          For private guest questions,
-          open your original secret link.
-        </p>
-      </div>
-    `;
-  }
-}
+    // REFRESH LOGIN SESSION
 
-function auth() {
-  app.innerHTML = `
-    <div class="authbox">
-      <h1 class="page-title">
-        JOIN THE CREW
-      </h1>
+    if (path === '/refresh' && method === 'POST') {
+      if (!body.refresh_token) {
+        return sendError(
+          res,
+          400,
+          'Missing refresh token.'
+        );
+      }
 
-      <div class="panel">
-        <h2 id="authTitle">
-          LOG IN
-        </h2>
+      const { data, error } =
+        await authClient.auth.refreshSession({
+          refresh_token: body.refresh_token
+        });
 
-        <form id="authForm">
-          <div id="nameField" hidden>
-            <label>DISPLAY NAME</label>
+      if (error || !data.session) {
+        return sendError(
+          res,
+          401,
+          error?.message || 'Session expired.'
+        );
+      }
 
-            <input
-              name="name"
-              placeholder="Your name"
-            >
-          </div>
+      return res.json({
+        ok: true,
+        session: sessionResponse(data.session)
+      });
+    }
 
-          <label>EMAIL</label>
+    // LOGOUT
+    // The frontend clears its stored tokens.
 
-          <input
-            type="email"
-            name="email"
-            required
-          >
+    if (path === '/logout' && method === 'POST') {
+      return res.json({ ok: true });
+    }
 
-          <label>PASSWORD</label>
+    // CREATE QUESTION
 
-          <input
-            type="password"
-            name="password"
-            required
-            minlength="10"
-          >
+    if (path === '/questions' && method === 'POST') {
+      if (body.website) {
+        return res.json({ ok: true });
+      }
 
-          <button class="action" type="submit">
-            LET ME IN ↗
-          </button>
-        </form>
+      const title = clean(body.title, 130);
+      const content = clean(body.body, 4000);
+      const visibility =
+        body.visibility === 'private'
+          ? 'private'
+          : 'public';
 
-        <p>
-          <button id="toggleAuth" type="button">
-            Create an account instead
-          </button>
-        </p>
+      const name = me?.name || clean(body.name, 60);
 
-        <p class="subtle">
-          Accounts are optional.
-          They save your name and let you track
-          questions across devices.
-        </p>
-      </div>
-    </div>
-  `;
+      if (
+        title.length < 4 ||
+        content.length < 8 ||
+        name.length < 2
+      ) {
+        return sendError(
+          res,
+          400,
+          'Name, title, and question are required.'
+        );
+      }
 
-  let register = false;
+      const guestToken = user
+        ? null
+        : randomBytes(32).toString('base64url');
 
-  $('#toggleAuth').onclick = () => {
-    register = !register;
-
-    $('#authTitle').textContent =
-      register ? 'CREATE ACCOUNT' : 'LOG IN';
-
-    $('#nameField').hidden = !register;
-
-    $('#nameField input').required = register;
-
-    $('#toggleAuth').textContent = register
-      ? 'Already registered? Log in'
-      : 'Create an account instead';
-  };
-
-  $('#authForm').onsubmit = async event => {
-    event.preventDefault();
-
-    const form = event.target;
-    const button = $('button[type=submit]', form);
-
-    const data = Object.fromEntries(new FormData(form));
-
-    button.disabled = true;
-
-    try {
-      const result = await post(
-        register ? '/register' : '/login',
-        data
+      const question = unwrap(
+        await sb
+          .from('questions')
+          .insert({
+            user_id: user?.id || null,
+            guest_token_hash: guestToken
+              ? hash(guestToken)
+              : null,
+            name,
+            title,
+            body: content,
+            visibility,
+            status: 'pending'
+          })
+          .select('id')
+          .single()
       );
 
-      if (result.session?.access_token) {
-        saveSession(result.session);
-      } else {
-        if (register && result.needsConfirmation) {
-          toast(
-            'Account created! Check your email to confirm it, then log in.'
-          );
-        } else {
-          toast(
-            'No login session was returned. Please try logging in.'
-          );
-        }
-
-        button.disabled = false;
-        return;
-      }
-
-      await refreshUser();
-
-      if (!me) {
-        toast(
-          'Login succeeded, but your profile could not be loaded.'
-        );
-
-        button.disabled = false;
-        return;
-      }
-
-      go(me.admin ? 'admin' : 'mine');
-
-      toast(`Welcome, ${me.name}!`);
-    } catch (error) {
-      toast(error.message);
-      button.disabled = false;
+      return res.json({
+        id: question.id,
+        token: guestToken,
+        visibility
+      });
     }
-  };
-}
 
-async function admin() {
-  if (!me?.admin) {
-    go('auth');
-    return;
-  }
+    // PUBLIC ARCHIVE
 
-  app.innerHTML = `
-    <h1 class="page-title">
-      AIHAM'S INBOX
-    </h1>
+    if (path === '/questions' && method === 'GET') {
+      const questions = unwrap(
+        await sb
+          .from('questions')
+          .select(
+            'id,title,body,name,visibility,status,created_at'
+          )
+          .eq('visibility', 'public')
+          .eq('status', 'published')
+          .order('id', { ascending: false })
+          .limit(100)
+      );
 
-    <p>Loading...</p>
-  `;
+      return res.json({ questions });
+    }
 
-  try {
-    const { questions, pendingReplies } =
-      await api('/admin/questions');
+    // MY QUESTIONS
 
-    const pendingCount =
-      questions.filter(q => q.status === 'pending').length;
+    if (path === '/mine' && method === 'GET') {
+      if (!user) {
+        return sendError(res, 401, 'Log in first.');
+      }
 
-    app.innerHTML = `
-      <h1 class="page-title">
-        AIHAM'S INBOX
-      </h1>
+      const questions = unwrap(
+        await sb
+          .from('questions')
+          .select(
+            'id,title,visibility,status,created_at'
+          )
+          .eq('user_id', user.id)
+          .order('id', { ascending: false })
+      );
 
-      <p class="muted">
-        ${pendingCount} questions awaiting review ·
-        ${pendingReplies.length}
-        public replies awaiting approval
-      </p>
+      return res.json({ questions });
+    }
 
-      <h2>QUESTIONS</h2>
+    // ADMIN INBOX
 
-      <div class="grid">
-        ${questions.map(q => `
-          <article class="qcard">
-            <span class="tag">
-              #${q.id} ·
-              ${esc(q.visibility)} ·
-              ${esc(q.status)}
-            </span>
+    if (
+      path === '/admin/questions' &&
+      method === 'GET'
+    ) {
+      if (!isAdmin) {
+        return sendError(res, 403, 'Admin only.');
+      }
 
-            <h3>${esc(q.title)}</h3>
+      const questions = unwrap(
+        await sb
+          .from('questions')
+          .select(
+            'id,title,body,name,visibility,status,created_at'
+          )
+          .order('id', { ascending: false })
+          .limit(300)
+      );
 
-            <p>${esc(q.body.slice(0, 220))}</p>
+      const pendingReplies = unwrap(
+        await sb
+          .from('replies')
+          .select(
+            'id,question_id,body,author:author_name,questions!inner(visibility)'
+          )
+          .eq('approved', false)
+          .eq('questions.visibility', 'public')
+          .order('id', { ascending: false })
+      );
 
-            <small>${esc(q.name)}</small>
+      return res.json({
+        questions,
+        pendingReplies
+      });
+    }
 
-            <div class="toolbar">
-              <button data-open="${q.id}">
-                OPEN
-              </button>
+    // VIEW SINGLE QUESTION
 
-              ${q.visibility === 'public' ? `
-                <button
-                  data-status="published"
-                  data-id="${q.id}"
-                >
-                  PUBLISH
-                </button>
-              ` : ''}
+    const questionMatch =
+      path.match(/^\/questions\/(\d+)$/);
 
-              <button
-                data-status="hidden"
-                data-id="${q.id}"
-              >
-                HIDE
-              </button>
+    if (questionMatch && method === 'GET') {
+      const question = unwrap(
+        await sb
+          .from('questions')
+          .select('*')
+          .eq('id', questionMatch[1])
+          .maybeSingle()
+      );
 
-              <button
-                class="danger"
-                data-delete="${q.id}"
-              >
-                DELETE
-              </button>
-            </div>
-          </article>
-        `).join('')}
-      </div>
+      if (!question) {
+        return sendError(
+          res,
+          404,
+          'Question not found.'
+        );
+      }
 
-      <h2>REPLIES TO MODERATE</h2>
+      const query = new URL(
+        req.url,
+        'https://localhost'
+      );
 
-      <div class="grid">
-        ${pendingReplies.map(reply => `
-          <article class="qcard">
-            <span class="tag">
-              ON QUESTION #${reply.question_id}
-            </span>
+      const guestToken = clean(
+        query.searchParams.get('token'),
+        200
+      );
 
-            <p>${esc(reply.body)}</p>
+      const owner = Boolean(
+        isAdmin ||
+        (user && question.user_id === user.id) ||
+        matchesToken(
+          guestToken,
+          question.guest_token_hash
+        )
+      );
 
-            <small>${esc(reply.author)}</small>
+      const publiclyVisible =
+        question.visibility === 'public' &&
+        question.status === 'published';
 
-            <div class="toolbar">
-              <button data-approve="${reply.id}">
-                APPROVE
-              </button>
+      if (!owner && !publiclyVisible) {
+        return sendError(
+          res,
+          404,
+          'Question not found or access denied.'
+        );
+      }
 
-              <button
-                class="danger"
-                data-delreply="${reply.id}"
-              >
-                DELETE
-              </button>
-            </div>
-          </article>
-        `).join('') || `
-          <div class="empty">
-            All caught up!
-          </div>
-        `}
-      </div>
-    `;
+      let replies = unwrap(
+        await sb
+          .from('replies')
+          .select(
+            'id,body,author:author_name,created_at,approved'
+          )
+          .eq('question_id', question.id)
+          .order('id', { ascending: true })
+      );
 
-    app.querySelectorAll('[data-open]').forEach(button => {
-      button.onclick = () => {
-        go('question/' + button.dataset.open);
-      };
-    });
+      if (!owner || !isAdmin) {
+        replies = replies.filter(
+          reply => reply.approved
+        );
+      }
 
-    app.querySelectorAll('[data-status]').forEach(button => {
-      button.onclick = async () => {
-        try {
-          await post(
-            '/admin/questions/' + button.dataset.id,
-            { status: button.dataset.status },
-            'PATCH'
-          );
+      const {
+        guest_token_hash,
+        user_id,
+        ...safeQuestion
+      } = question;
 
-          admin();
-        } catch (error) {
-          toast(error.message);
-        }
-      };
-    });
+      return res.json({
+        question: {
+          ...safeQuestion,
+          replies: replies.map(
+            ({ approved, ...reply }) => reply
+          )
+        },
+        canReply: owner
+      });
+    }
 
-    app.querySelectorAll('[data-delete]').forEach(button => {
-      button.onclick = async () => {
-        if (!confirm('Permanently delete this question?')) {
-          return;
-        }
+    // REPLY TO QUESTION
 
-        try {
-          await api(
-            '/admin/questions/' + button.dataset.delete,
-            { method: 'DELETE' }
-          );
+    const replyMatch =
+      path.match(/^\/questions\/(\d+)\/replies$/);
 
-          admin();
-        } catch (error) {
-          toast(error.message);
-        }
-      };
-    });
+    if (replyMatch && method === 'POST') {
+      const question = unwrap(
+        await sb
+          .from('questions')
+          .select('*')
+          .eq('id', replyMatch[1])
+          .maybeSingle()
+      );
 
-    app.querySelectorAll('[data-approve]').forEach(button => {
-      button.onclick = async () => {
-        try {
-          await post(
-            '/admin/replies/' + button.dataset.approve,
-            { approved: true },
-            'PATCH'
-          );
+      if (!question) {
+        return sendError(
+          res,
+          404,
+          'Question not found.'
+        );
+      }
 
-          admin();
-        } catch (error) {
-          toast(error.message);
-        }
-      };
-    });
+      const allowed = Boolean(
+        isAdmin ||
+        (user && question.user_id === user.id) ||
+        matchesToken(
+          clean(body.token, 200),
+          question.guest_token_hash
+        )
+      );
 
-    app.querySelectorAll('[data-delreply]').forEach(button => {
-      button.onclick = async () => {
-        try {
-          await api(
-            '/admin/replies/' + button.dataset.delreply,
-            { method: 'DELETE' }
-          );
+      if (!allowed) {
+        return sendError(
+          res,
+          403,
+          'Not authorized to reply.'
+        );
+      }
 
-          admin();
-        } catch (error) {
-          toast(error.message);
-        }
-      };
-    });
+      const content = clean(body.body, 4000);
+
+      if (content.length < 2) {
+        return sendError(
+          res,
+          400,
+          'Reply is too short.'
+        );
+      }
+
+      unwrap(
+        await sb
+          .from('replies')
+          .insert({
+            question_id: question.id,
+            body: content,
+            author_id: user?.id || null,
+            author_name: isAdmin
+              ? 'Aiham'
+              : question.name,
+            approved: isAdmin
+          })
+      );
+
+      return res.json({ ok: true });
+    }
+
+    // ADMIN QUESTION ACTIONS
+
+    const adminQuestionMatch =
+      path.match(/^\/admin\/questions\/(\d+)$/);
+
+    if (adminQuestionMatch && method === 'PATCH') {
+      if (!isAdmin) {
+        return sendError(res, 403, 'Admin only.');
+      }
+
+      const question = unwrap(
+        await sb
+          .from('questions')
+          .select('visibility')
+          .eq('id', adminQuestionMatch[1])
+          .maybeSingle()
+      );
+
+      if (!question) {
+        return sendError(
+          res,
+          404,
+          'Question not found.'
+        );
+      }
+
+      const status = body.status;
+
+      if (
+        !['pending', 'published', 'hidden'].includes(status) ||
+        (
+          question.visibility === 'private' &&
+          status === 'published'
+        )
+      ) {
+        return sendError(
+          res,
+          400,
+          'Invalid question status.'
+        );
+      }
+
+      unwrap(
+        await sb
+          .from('questions')
+          .update({ status })
+          .eq('id', adminQuestionMatch[1])
+      );
+
+      return res.json({ ok: true });
+    }
+
+    if (adminQuestionMatch && method === 'DELETE') {
+      if (!isAdmin) {
+        return sendError(res, 403, 'Admin only.');
+      }
+
+      unwrap(
+        await sb
+          .from('questions')
+          .delete()
+          .eq('id', adminQuestionMatch[1])
+      );
+
+      return res.json({ ok: true });
+    }
+
+    // ADMIN REPLY MODERATION
+
+    const adminReplyMatch =
+      path.match(/^\/admin\/replies\/(\d+)$/);
+
+    if (adminReplyMatch && method === 'PATCH') {
+      if (!isAdmin) {
+        return sendError(res, 403, 'Admin only.');
+      }
+
+      const reply = unwrap(
+        await sb
+          .from('replies')
+          .select('question_id')
+          .eq('id', adminReplyMatch[1])
+          .maybeSingle()
+      );
+
+      if (!reply) {
+        return sendError(
+          res,
+          404,
+          'Reply not found.'
+        );
+      }
+
+      const question = unwrap(
+        await sb
+          .from('questions')
+          .select('visibility')
+          .eq('id', reply.question_id)
+          .single()
+      );
+
+      if (question.visibility !== 'public') {
+        return sendError(
+          res,
+          400,
+          'Only public replies can be moderated.'
+        );
+      }
+
+      unwrap(
+        await sb
+          .from('replies')
+          .update({
+            approved: body.approved === true
+          })
+          .eq('id', adminReplyMatch[1])
+      );
+
+      return res.json({ ok: true });
+    }
+
+    if (adminReplyMatch && method === 'DELETE') {
+      if (!isAdmin) {
+        return sendError(res, 403, 'Admin only.');
+      }
+
+      unwrap(
+        await sb
+          .from('replies')
+          .delete()
+          .eq('id', adminReplyMatch[1])
+      );
+
+      return res.json({ ok: true });
+    }
+
+    return sendError(res, 404, 'Not found.');
+
   } catch (error) {
-    toast(error.message);
+    console.error('API error:', {
+      message: error?.message,
+      code: error?.code,
+      cause: error?.cause?.message
+    });
+
+    return sendError(
+      res,
+      500,
+      'Server error. Check Vercel logs.'
+    );
   }
 }
-
-function render() {
-  syncNav();
-
-  if (current === 'home') {
-    home();
-  } else if (current === 'archive') {
-    archive();
-  } else if (current === 'mine') {
-    mine();
-  } else if (current === 'auth') {
-    auth();
-  } else if (current === 'admin') {
-    admin();
-  } else if (current.startsWith('question/')) {
-    question();
-  } else {
-    go('home');
-  }
-}
-
-init();
