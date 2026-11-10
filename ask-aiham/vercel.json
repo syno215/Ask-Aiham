@@ -1,1 +1,14 @@
-{"rewrites":[{"source":"/((?!api/|fonts/|app\\.js$|style\\.css$|index\\.html$).*)","destination":"/index.html"}]}
+
+{
+  "version": 2,
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "/api/[...path]"
+    },
+    {
+      "source": "/((?!api(?:/|$)).*)",
+      "destination": "/index.html"
+    }
+  ]
+}
